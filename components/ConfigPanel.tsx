@@ -1,6 +1,6 @@
 import React, { useRef, useState } from 'react';
-import { Upload, Loader2, Wand2, Sparkles, CheckCircle2 } from 'lucide-react';
-import { AppConfig, VideoStyle, VideoType, Language, Accent, VisionAnalysis } from '../types';
+import { Upload, Loader2, Wand2, Sparkles, CheckCircle2, AlertCircle, XCircle } from 'lucide-react'; // Thêm icon AlertCircle, XCircle
+import { AppConfig, VideoStyle, VideoType, Language, Accent } from '../types';
 import { analyzeProductImage, fileToGenerativePart } from '../services/geminiService';
 import { AnalysisChart } from './AnalysisChart';
 
@@ -13,6 +13,7 @@ interface ConfigPanelProps {
 
 export const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, setConfig, onGenerateScripts, isGeneratingScripts }) => {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null); // State mới để lưu lỗi
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -20,6 +21,8 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, setConfig, onG
     if (!file) return;
 
     setIsAnalyzing(true);
+    setErrorMsg(null); // Xóa lỗi cũ trước khi bắt đầu cái mới
+
     try {
       const base64 = await fileToGenerativePart(file);
       const analysis = await analyzeProductImage(base64);
@@ -29,11 +32,17 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, setConfig, onG
         visionData: analysis,
         productDescription: `Một ${analysis.category} phong cách ${analysis.style} với tông màu ${analysis.color_tone}. Phù hợp cho độ tuổi ${analysis.target_age}. Tone: ${analysis.brand_tone}. \n\nĐiểm nổi bật:\n- ${analysis.usp_highlights.join('\n- ')}`
       }));
-    } catch (error) {
+    } catch (error: any) {
       console.error("Analysis failed", error);
-      alert("Không thể phân tích ảnh. Vui lòng thử lại.");
+      // Lấy message từ error mà geminiService đã xử lý (Tiếng Việt)
+      // Nếu không có message thì mới fallback về lỗi mặc định
+      setErrorMsg(error.message || "Không thể phân tích ảnh. Vui lòng thử lại.");
     } finally {
       setIsAnalyzing(false);
+      // Reset input file để cho phép chọn lại cùng 1 file nếu muốn
+      if (fileInputRef.current) {
+        fileInputRef.current.value = '';
+      }
     }
   };
 
@@ -56,10 +65,30 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, setConfig, onG
             {config.visionData && <CheckCircle2 className="w-4 h-4 text-green-500" />}
           </div>
           
+          {/* Vùng hiển thị LỖI (Error Banner) */}
+          {errorMsg && (
+            <div className="bg-red-50 border border-red-200 rounded-lg p-4 flex items-start gap-3 animate-in fade-in slide-in-from-top-2">
+              <AlertCircle className="w-5 h-5 text-red-600 flex-shrink-0 mt-0.5" />
+              <div className="flex-1">
+                <h3 className="text-sm font-medium text-red-800">Lỗi phân tích</h3>
+                <p className="text-xs text-red-600 mt-1 leading-relaxed">
+                  {errorMsg}
+                </p>
+              </div>
+              <button onClick={() => setErrorMsg(null)} className="text-red-400 hover:text-red-600">
+                <XCircle className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
           <div 
             onClick={() => fileInputRef.current?.click()}
             className={`border-2 border-dashed rounded-xl p-6 text-center transition-all cursor-pointer group ${
-              config.visionData ? 'border-green-300 bg-green-50' : 'border-fashion-200 hover:border-fashion-400 hover:bg-fashion-50'
+              errorMsg 
+                ? 'border-red-300 bg-red-50/30' // Đổi màu viền nếu có lỗi
+                : config.visionData 
+                  ? 'border-green-300 bg-green-50' 
+                  : 'border-fashion-200 hover:border-fashion-400 hover:bg-fashion-50'
             }`}
           >
             <input 
@@ -77,7 +106,7 @@ export const ConfigPanel: React.FC<ConfigPanelProps> = ({ config, setConfig, onG
             ) : config.visionData ? (
               <div className="flex flex-col items-center">
                 <img 
-                  src="https://picsum.photos/200/200?blur=5" // Placeholder for uploaded preview - in real app would use state
+                  src="https://picsum.photos/200/200?blur=5" 
                   className="w-16 h-16 rounded-lg object-cover mb-2 opacity-50" 
                   alt="Uploaded"
                 />
