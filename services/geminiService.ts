@@ -1,50 +1,104 @@
 import { GoogleGenAI, Type, Schema } from "@google/genai";
 import { AppConfig, VisionAnalysis, Script, GeneratedVeoData } from "../types";
 
+// --- CẤU HÌNH DANH SÁCH MODEL (Ưu tiên từ trên xuống dưới) ---
+const MODEL_PRIORITY = [
+  'gemini-2.5-flash',       // Ưu tiên 1: Mới nhất (Có thể chưa ổn định)
+  'gemini-2.0-flash',       // Ưu tiên 2: Bản 2.0 Stable
+  'gemini-1.5-flash',       // Ưu tiên 3: Bản cũ nhưng cực kỳ trâu bò (Fallback cuối cùng)
+];
+
 const getAI = () => new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-// --- CẤU HÌNH XỬ LÝ LỖI ---
-/**
- * Hàm này chịu trách nhiệm:
- * 1. In lỗi chi tiết ra Console (F12) cho Dev xem.
- * 2. Trả về thông báo tiếng Việt thân thiện cho UI hiển thị.
- */
-const handleGeminiError = (error: any): never => {
-  // 1. Log chi tiết kỹ thuật cho Developer (F12)
-  console.group("🚨 GEMINI API ERROR DETAILS");
-  console.error("Raw Error Object:", error);
-  if (error.message) console.error("Message:", error.message);
-  if (error.status) console.error("Status Code:", error.status);
-  if (error.body) console.error("Response Body:", error.body);
-  console.groupEnd();
+// --- HELPER: Delay ---
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-  // 2. Phân loại lỗi để trả về thông báo cho User
-  let userMessage = "Đã xảy ra lỗi không xác định khi xử lý. Vui lòng thử lại.";
-  
-  // Lấy chuỗi lỗi để so sánh
+// --- XỬ LÝ LỖI (Giữ nguyên logic của bạn nhưng tách ra để tái sử dụng) ---
+const parseGeminiError = (error: any): string => {
   const errString = JSON.stringify(error) + (error.message || "");
-
+  
   if (errString.includes("429") || errString.includes("Quota exceeded") || errString.includes("RESOURCE_EXHAUSTED")) {
-    userMessage = "⚠️ Đã hết hạn mức sử dụng miễn phí trong ngày (Limit 20 req/day) hoặc Server quá tải. Vui lòng quay lại vào ngày mai hoặc đổi Model.";
+    return "⚠️ Đã hết hạn mức sử dụng miễn phí hoặc Server quá tải. Vui lòng thử lại sau.";
   } 
-  else if (errString.includes("401") || errString.includes("API_KEY_INVALID")) {
-    userMessage = "🔑 Lỗi xác thực: API Key không hợp lệ hoặc chưa được cấu hình.";
+  if (errString.includes("401") || errString.includes("API_KEY_INVALID")) {
+    return "🔑 Lỗi xác thực: API Key không hợp lệ.";
   } 
-  else if (errString.includes("503") || errString.includes("Overloaded")) {
-    userMessage = "🐢 Máy chủ AI đang quá tải tạm thời. Vui lòng đợi 30 giây rồi thử lại.";
+  if (errString.includes("503") || errString.includes("Overloaded")) {
+    return "🐢 Máy chủ AI đang quá tải tạm thời.";
   } 
-  else if (errString.includes("SAFETY") || errString.includes("BLOCKED")) {
-    userMessage = "🛡️ Nội dung hình ảnh hoặc yêu cầu bị chặn bởi bộ lọc an toàn của Google.";
+  if (errString.includes("SAFETY") || errString.includes("BLOCKED")) {
+    return "🛡️ Nội dung bị chặn bởi bộ lọc an toàn.";
   } 
-  else if (errString.includes("404") || errString.includes("mismatched revision")) {
-    userMessage = "❌ Model AI không tồn tại hoặc phiên bản model bị sai (Kiểm tra lại tên model 'gemini-2.5-flash').";
+  if (errString.includes("404") || errString.includes("not found")) {
+    return "❌ Model AI không tồn tại (Sai tên model).";
   }
-
-  // Ném lỗi mới với thông báo tiếng Việt
-  throw new Error(userMessage);
+  return "Đã xảy ra lỗi không xác định khi xử lý.";
 };
 
-// --- Helper: File to Base64 ---
+// --- CORE: HÀM GỌI API THÔNG MINH (FALLBACK LOGIC) ---
+/**
+ * Hàm này sẽ thử lần lượt các model trong danh sách MODEL_PRIORITY.
+ * Nếu gặp lỗi 503/Overloaded/404 -> Tự động chuyển sang model tiếp theo.
+ * Nếu gặp lỗi Fatal (401, Safety) -> Dừng ngay lập tức.
+ */
+const generateWithFallback = async <T>(
+  contents: any, 
+  schema: Schema, 
+  userPromptName: string
+): Promise<T> => {
+  const ai = getAI();
+  let lastError: any = null;
+
+  for (const modelName of MODEL_PRIORITY) {
+    try {
+      console.log(`🚀 [${userPromptName}] Đang thử model: ${modelName}...`);
+      
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: contents,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: schema
+        }
+      });
+
+      if (!response.text) throw new Error("API trả về rỗng (No content)");
+      
+      // Nếu thành công -> Trả về kết quả ngay
+      console.log(`✅ [${userPromptName}] Thành công với model: ${modelName}`);
+      return JSON.parse(response.text) as T;
+
+    } catch (error: any) {
+      lastError = error;
+      const errString = JSON.stringify(error) + (error.message || "");
+      
+      // Chỉ thử lại (Retry) nếu lỗi là 503 (Quá tải) hoặc 404 (Model chưa có ở region này)
+      const isRetryable = errString.includes("503") || errString.includes("Overloaded") || errString.includes("404") || errString.includes("not found");
+
+      if (isRetryable) {
+        console.warn(`⚠️ [${userPromptName}] Model ${modelName} thất bại (Server Busy/Not Found). Đang chuyển model...`);
+        await delay(1000); // Nghỉ 1s trước khi gọi model tiếp theo
+        continue; // Chuyển sang vòng lặp tiếp theo (Model kế tiếp)
+      } else {
+        // Nếu lỗi là 401 (Sai Key), Safety (Vi phạm), 400 (Bad Request) -> Ném lỗi luôn, không thử lại
+        console.error(`🛑 [${userPromptName}] Lỗi nghiêm trọng tại ${modelName}:`, error);
+        break; 
+      }
+    }
+  }
+
+  // Nếu chạy hết danh sách mà vẫn lỗi -> Ném lỗi cuối cùng ra UI
+  const friendlyMessage = parseGeminiError(lastError);
+  
+  // Log chi tiết cho Dev
+  console.group("🚨 GEMINI FINAL ERROR");
+  console.error(lastError);
+  console.groupEnd();
+
+  throw new Error(`${friendlyMessage} (Đã thử tất cả các model: ${MODEL_PRIORITY.join(', ')})`);
+};
+
+// --- Helper: File to Base64 (Giữ nguyên) ---
 export const fileToGenerativePart = async (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -58,259 +112,168 @@ export const fileToGenerativePart = async (file: File): Promise<string> => {
   });
 };
 
+// =================================================================
+// CÁC HÀM NGHIỆP VỤ (Đã được rút gọn nhờ generateWithFallback)
+// =================================================================
+
 // --- 1. Vision Analysis ---
 export const analyzeProductImage = async (base64Image: string): Promise<VisionAnalysis> => {
-  try {
-    const ai = getAI();
-    
-    const prompt = `
-      Phân tích hình ảnh sản phẩm thời trang này để viết kịch bản video marketing.
-      Trích xuất các chi tiết sau dưới dạng JSON (Giá trị trả về phải bằng Tiếng Việt):
-      - category: Loại sản phẩm (ví dụ: Váy mùa hè, Vest công sở).
-      - color_tone: Bảng màu chủ đạo.
-      - style: Phong cách thời trang (ví dụ: Tối giản, Vintage, Đường phố).
-      - target_age: Độ tuổi khách hàng mục tiêu ước tính.
-      - brand_tone: Giọng điệu thương hiệu gợi ý (ví dụ: Sang trọng, Vui tươi).
-      - usp_highlights: 5 điểm bán hàng độc nhất (USP) hoặc điểm nhấn hình ảnh.
-      - tone_scores: Một mảng các đối tượng có 'name' (thuộc tính như 'Sang trọng', 'Thoải mái', 'Táo bạo', 'Thanh lịch', 'Xu hướng') và 'value' (điểm số nguyên 0-100).
-    `;
+  const prompt = `
+    Phân tích hình ảnh sản phẩm thời trang này để viết kịch bản video marketing.
+    Trích xuất các chi tiết sau dưới dạng JSON (Giá trị trả về phải bằng Tiếng Việt):
+    - category: Loại sản phẩm.
+    - color_tone: Bảng màu chủ đạo.
+    - style: Phong cách thời trang.
+    - target_age: Độ tuổi khách hàng mục tiêu ước tính.
+    - brand_tone: Giọng điệu thương hiệu gợi ý.
+    - usp_highlights: 5 điểm bán hàng độc nhất (USP).
+    - tone_scores: Mảng đối tượng {name, value} (0-100).
+  `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: {
-        parts: [
-          { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
-          { text: prompt }
-        ]
-      },
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
+  const contents = {
+    parts: [
+      { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
+      { text: prompt }
+    ]
+  };
+
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      category: { type: Type.STRING },
+      color_tone: { type: Type.STRING },
+      style: { type: Type.STRING },
+      target_age: { type: Type.STRING },
+      brand_tone: { type: Type.STRING },
+      usp_highlights: { type: Type.ARRAY, items: { type: Type.STRING } },
+      tone_scores: {
+        type: Type.ARRAY,
+        items: {
           type: Type.OBJECT,
           properties: {
-            category: { type: Type.STRING },
-            color_tone: { type: Type.STRING },
-            style: { type: Type.STRING },
-            target_age: { type: Type.STRING },
-            brand_tone: { type: Type.STRING },
-            usp_highlights: { type: Type.ARRAY, items: { type: Type.STRING } },
-            tone_scores: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  name: { type: Type.STRING },
-                  value: { type: Type.INTEGER }
-                }
-              }
-            }
+            name: { type: Type.STRING },
+            value: { type: Type.INTEGER }
           }
         }
       }
-    });
+    }
+  };
 
-    if (!response.text) throw new Error("API trả về rỗng (No content)");
-    return JSON.parse(response.text) as VisionAnalysis;
-
-  } catch (error) {
-    return handleGeminiError(error);
-  }
+  return generateWithFallback<VisionAnalysis>(contents, schema, "Vision Analysis");
 };
 
 // --- 2. Generate Scripts ---
 export const generateScripts = async (config: AppConfig): Promise<Script[]> => {
-  try {
-    const ai = getAI();
+  const isNoDialogue = config.videoStyle.includes('Không lời thoại');
+  
+  const strictRequirements = isNoDialogue
+    ? `YÊU CẦU ĐẶC BIỆT: Video KHÔNG LỜI THOẠI. Trường 'dialogue_or_text' chỉ chứa Text Overlay hoặc ghi chú âm nhạc.`
+    : `YÊU CẦU: Viết lời thoại tự nhiên, hấp dẫn, phù hợp giọng đọc ${config.accent}.`;
+
+  const prompt = `
+    Đóng vai Đạo diễn Video Thời trang. Tạo 5 kịch bản video 30s cho:
+    Sản phẩm: ${config.productName}
+    Mô tả: ${config.productDescription}
+    Vision Data: ${JSON.stringify(config.visionData)}
+    Phong cách: ${config.videoStyle}, Loại: ${config.videoType}, Ngôn ngữ: ${config.language}
     
-    const isNoDialogue = config.videoStyle.includes('Không lời thoại');
-    
-    const strictRequirements = isNoDialogue
-      ? `YÊU CẦU ĐẶC BIỆT: Đây là video KHÔNG LỜI THOẠI (Non-verbal). 
-         - Tuyệt đối KHÔNG viết lời thoại cho nhân vật. 
-         - Trường 'dialogue_or_text' CHỈ ĐƯỢC chứa nội dung chữ hiển thị (Text Overlay) hoặc ghi chú về âm nhạc/âm thanh.
-         - Tập trung mô tả hành động và biểu cảm.`
-      : `YÊU CẦU: Viết lời thoại tự nhiên, hấp dẫn, phù hợp với giọng đọc ${config.accent}.`;
+    YÊU CẦU:
+    1. ${strictRequirements}
+    2. Mỗi kịch bản đúng 3 cảnh.
+    3. Trả về mảng JSON.
+  `;
 
-    const prompt = `
-      Đóng vai một Đạo diễn Video Thời trang chuyên nghiệp.
-      Tạo 5 kịch bản video 30 giây khác biệt cho sản phẩm sau.
-      Nội dung kịch bản phải viết bằng Tiếng Việt (trừ khi Ngôn ngữ được chọn là Tiếng Anh).
-      
-      Sản phẩm: ${config.productName}
-      Mô tả: ${config.productDescription}
-      Dữ liệu phân tích Vision: ${JSON.stringify(config.visionData)}
-      
-      Cài đặt:
-      - Phong cách: ${config.videoStyle}
-      - Loại: ${config.videoType}
-      - Ngôn ngữ: ${config.language}
-      - Giọng đọc: ${config.accent}
-      
-      YÊU CẦU BẮT BUỘC (TUÂN THỦ TUYỆT ĐỐI):
-      1. SỐ LƯỢNG CẢNH: Mỗi kịch bản phải có ĐÚNG 3 CẢNH (SCENES). Không được viết nhiều hơn hay ít hơn 3 cảnh.
-      2. ${strictRequirements}
-      3. Tổng thời lượng xấp xỉ 30 giây.
-      4. Các kịch bản nên khác nhau về góc độ (ví dụ: một cái thiên về cảm xúc, một cái nhịp độ nhanh, một cái tập trung vào tính năng).
-      
-      Trả về một mảng JSON gồm 5 kịch bản.
-    `;
-
-    const schema: Schema = {
-      type: Type.ARRAY,
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          id: { type: Type.STRING },
-          title: { type: Type.STRING },
-          hook: { type: Type.STRING },
-          rationale: { type: Type.STRING, description: "Lý do tại sao kịch bản này hiệu quả" },
-          benefits_highlighted: { type: Type.ARRAY, items: { type: Type.STRING } },
-          cta_overlay: { type: Type.STRING },
-          cta_voice: { type: Type.STRING },
-          scenes: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                time: { type: Type.STRING },
-                action: { type: Type.STRING },
-                dialogue_or_text: { type: Type.STRING, description: isNoDialogue ? "Chỉ chữ hiển thị (Overlay) hoặc Âm nhạc" : "Lời thoại hoặc chữ hiển thị" },
-                camera_angle: { type: Type.STRING },
-                visual_prompt: { type: Type.STRING, description: "Mô tả hình ảnh ngắn gọn cho AI tạo video (Viết bằng Tiếng Anh để tối ưu cho Veo)" },
-                music: { type: Type.STRING }
-              }
-            }
-          }
-        }
-      }
-    };
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: schema
-      }
-    });
-
-    if (!response.text) throw new Error("API trả về rỗng (No content)");
-    return JSON.parse(response.text) as Script[];
-
-  } catch (error) {
-    return handleGeminiError(error);
-  }
-};
-
-// --- 3. Generate Veo-3 Prompt ---
-export const generateVeoPrompt = async (script: Script, config: AppConfig): Promise<GeneratedVeoData> => {
-  try {
-    const ai = getAI();
-    
-    const prompt = `
-      Dựa trên kịch bản video đã chọn gồm ${script.scenes.length} cảnh, hãy tạo ${script.scenes.length} JSON prompt riêng biệt tương ứng với từng phân cảnh (scene) để tạo video bằng model Veo-3.
-      Nội dung trong JSON (description, style, characters, etc.) phải viết bằng TIẾNG ANH (English) chuẩn.
-      
-      Thông tin đầu vào:
-      - Tiêu đề kịch bản: ${script.title}
-      - Sản phẩm: ${config.productName}
-      - Vision Data: ${JSON.stringify(config.visionData)}
-      - Script Content: ${JSON.stringify(script)}
-      
-      YÊU CẦU TỐI ƯU HÓA CHẤT LƯỢNG (NÂNG CAO):
-      Để tạo ra video chất lượng cao nhất, hãy tự động thêm các chi tiết chuyên nghiệp sau vào prompt (Enrichment) ngay cả khi kịch bản gốc không ghi rõ:
-      1. CAMERA: Sử dụng ngôn ngữ điện ảnh cụ thể (ví dụ: "Slow cinematic dolly-in", "Low-angle tracking shot", "Smooth pan revealing details", "Rack focus from blurry foreground"). Tránh các góc máy tĩnh nhàm chán.
-      2. LIGHTING: Mô tả chi tiết hướng và chất lượng ánh sáng (ví dụ: "Soft volumetric lighting", "Golden hour rim-light emphasizing texture", "Studio fashion lighting with softbox", "Moody chiaroscuro").
-      3. MOTION: Mô tả chuyển động vi mô (micro-movements) để nhân vật sống động (ví dụ: "fingers gently tracing the fabric", "subtle shift in weight", "hair blowing softly in wind", "eyes glancing confidently").
-      4. STYLE: Thêm các từ khóa chất lượng cao (ví dụ: "8k", "photorealistic", "highly detailed texture", "fashion magazine editorial look", "shot on Arri Alexa").
-      
-      QUAN TRỌNG: 
-      1. Trả về mảng "scenePrompts" chứa đúng ${script.scenes.length} đối tượng JSON.
-      2. Mỗi đối tượng JSON tương ứng với 1 cảnh trong kịch bản theo đúng thứ tự.
-      3. Cấu trúc mỗi JSON phải chính xác như sau:
-      
-      {
-        "description": "Mô tả chi tiết phân cảnh...",
-        "style": "Elegant, contemporary fashion editorial...",
-        "camera": "Góc máy và chuyển động của cảnh này...",
-        "lighting": "Ánh sáng...",
-        "environment": "Bối cảnh...",
-        "characters": [ ... ],
-        "motion": "Hành động cụ thể trong cảnh này...",
-        "dialogue": [ ... ],
-        "ending": "Kết thúc của cảnh này...",
-        "text": "văn bản hiển thị",
-        "keywords": [ ... ],
-        "aspect_ratio": "9:16"
-      }
-
-      Ngoài ra, tạo thêm các tài sản marketing (adsCaption, hashtags, ctaVariations) bằng Tiếng Việt.
-    `;
-
-    // Schema definition for a single Veo Prompt Structure to be reused in array
-    const veoPromptSchema: Schema = {
+  const schema: Schema = {
+    type: Type.ARRAY,
+    items: {
       type: Type.OBJECT,
       properties: {
-        description: { type: Type.STRING },
-        style: { type: Type.STRING },
-        camera: { type: Type.STRING },
-        lighting: { type: Type.STRING },
-        environment: { type: Type.STRING },
-        characters: {
+        id: { type: Type.STRING },
+        title: { type: Type.STRING },
+        hook: { type: Type.STRING },
+        rationale: { type: Type.STRING },
+        benefits_highlighted: { type: Type.ARRAY, items: { type: Type.STRING } },
+        cta_overlay: { type: Type.STRING },
+        cta_voice: { type: Type.STRING },
+        scenes: {
           type: Type.ARRAY,
           items: {
             type: Type.OBJECT,
             properties: {
-              name: { type: Type.STRING },
-              age: { type: Type.STRING },
-              gender: { type: Type.STRING },
-              ethnicity: { type: Type.STRING },
-              appearance: {
-                type: Type.OBJECT,
-                properties: {
-                  hair: { type: Type.STRING },
-                  expression: { type: Type.STRING },
-                  outfit: { type: Type.STRING }
-                }
-              }
+              time: { type: Type.STRING },
+              action: { type: Type.STRING },
+              dialogue_or_text: { type: Type.STRING },
+              camera_angle: { type: Type.STRING },
+              visual_prompt: { type: Type.STRING },
+              music: { type: Type.STRING }
             }
           }
-        },
-        motion: { type: Type.STRING },
-        dialogue: { type: Type.ARRAY, items: { type: Type.STRING } },
-        ending: { type: Type.STRING },
-        text: { type: Type.STRING },
-        keywords: { type: Type.ARRAY, items: { type: Type.STRING } },
-        aspect_ratio: { type: Type.STRING }
+        }
       }
-    };
+    }
+  };
 
-    const schema: Schema = {
-      type: Type.OBJECT,
-      properties: {
-        scenePrompts: {
-          type: Type.ARRAY,
-          items: veoPromptSchema
-        },
-        adsCaption: { type: Type.STRING },
-        hashtags: { type: Type.ARRAY, items: { type: Type.STRING } },
-        ctaVariations: { type: Type.ARRAY, items: { type: Type.STRING } }
-      }
-    };
+  return generateWithFallback<Script[]>(prompt, schema, "Generate Scripts");
+};
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: schema
-      }
-    });
+// --- 3. Generate Veo-3 Prompt ---
+export const generateVeoPrompt = async (script: Script, config: AppConfig): Promise<GeneratedVeoData> => {
+  const prompt = `
+    Tạo ${script.scenes.length} JSON prompt Tiếng Anh cho model Veo-3 dựa trên kịch bản: "${script.title}".
+    Vision Data: ${JSON.stringify(config.visionData)}
+    
+    YÊU CẦU ENRICHMENT (Thêm chi tiết điện ảnh):
+    - Camera: Cinematic dolly, tracking shot...
+    - Lighting: Volumetric, golden hour...
+    - Motion: Micro-movements...
+    - Style: 8k, photorealistic...
+    
+    Trả về cấu trúc JSON chuẩn cho Veo.
+  `;
 
-    if (!response.text) throw new Error("API trả về rỗng (No content)");
-    return JSON.parse(response.text) as GeneratedVeoData;
+  // Schema definitions (giữ nguyên cấu trúc của bạn)
+  const veoPromptSchema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      description: { type: Type.STRING },
+      style: { type: Type.STRING },
+      camera: { type: Type.STRING },
+      lighting: { type: Type.STRING },
+      environment: { type: Type.STRING },
+      characters: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            name: { type: Type.STRING },
+            age: { type: Type.STRING },
+            gender: { type: Type.STRING },
+            ethnicity: { type: Type.STRING },
+            appearance: {
+              type: Type.OBJECT,
+              properties: { hair: { type: Type.STRING }, expression: { type: Type.STRING }, outfit: { type: Type.STRING } }
+            }
+          }
+        }
+      },
+      motion: { type: Type.STRING },
+      dialogue: { type: Type.ARRAY, items: { type: Type.STRING } },
+      ending: { type: Type.STRING },
+      text: { type: Type.STRING },
+      keywords: { type: Type.ARRAY, items: { type: Type.STRING } },
+      aspect_ratio: { type: Type.STRING }
+    }
+  };
 
-  } catch (error) {
-    return handleGeminiError(error);
-  }
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      scenePrompts: { type: Type.ARRAY, items: veoPromptSchema },
+      adsCaption: { type: Type.STRING },
+      hashtags: { type: Type.ARRAY, items: { type: Type.STRING } },
+      ctaVariations: { type: Type.ARRAY, items: { type: Type.STRING } }
+    }
+  };
+
+  return generateWithFallback<GeneratedVeoData>(prompt, schema, "Veo Prompts");
 };
